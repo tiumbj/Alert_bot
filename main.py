@@ -8,6 +8,7 @@
 import json
 import os
 import sys
+from pathlib import Path
 from datetime import datetime, timezone
 import time
 
@@ -19,14 +20,35 @@ except ImportError:
     MT5_AVAILABLE = False
 
 # Fallback import
+import pandas as pd
+
 try:
     import yfinance as yf
-    import pandas as pd
     YFINANCE_AVAILABLE = True
 except ImportError:
     YFINANCE_AVAILABLE = False
 
-from telegram_notifier import send_telegram_message
+    import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+try:
+    from core.structure_engine import evaluate_entry_state
+except Exception:
+    evaluate_entry_state = None
+
+try:
+    from core.dashboard_state_writer import update_dashboard_state
+except Exception:
+    try:
+        from dashboard_state_writer import update_dashboard_state
+    except Exception:
+        update_dashboard_state = None
+
+from telegram_notifier import build_telegram_message, send_telegram_message
 
 
 # ==============================================================================
@@ -34,7 +56,7 @@ from telegram_notifier import send_telegram_message
 # ==============================================================================
 
 SYMBOL = "GOLD"
-MT5_SYMBOL = "XAUUSD"
+MT5_SYMBOL = "GOLD"
 TIMEFRAME_MINUTES = 15
 SIGNAL_CHECK_INTERVAL_SEC = 60
 TELEGRAM_ENABLED = True
@@ -43,6 +65,10 @@ TELEGRAM_ENABLED = True
 RISK_REWARD_MIN = 1.5
 ATR_SL_MULTIPLIER = 1.2
 ATR_TP_MULTIPLIER = 2.5
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+RUNTIME_DIR = PROJECT_ROOT / "runtime"
+DASHBOARD_STATE_PATH = RUNTIME_DIR / "dashboard_state.json"
 
 
 # ==============================================================================
@@ -57,14 +83,18 @@ def ensure_directories():
 def log_system(message):
     timestamp = datetime.now(timezone.utc).isoformat()
     log_line = f"[{timestamp}] {message}\n"
-    with open("logs/system.log", "a") as f:
+    with open("logs/system.log", "a", encoding="utf-8") as f:
         f.write(log_line)
-    print(log_line.strip())
+    try:
+        print(log_line.strip())
+    except UnicodeEncodeError:
+        safe = log_line.strip().encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        print(safe)
 
 
 def log_signal(signal_data):
     with open("logs/signals.jsonl", "a") as f:
-        f.write(json.dumps(signal_data) + "\n")
+        f.write(json.dumps(signal_data, ensure_ascii=False) + "\n")
 
 
 # ==============================================================================
@@ -182,7 +212,7 @@ def analyze_market(df):
     """
     
     if len(df) < 50:
-        return "NO TRADE", ["Insufficient data"]
+        return "NO TRADE", ["ข้อมูลยังไม่พอสำหรับประเมินสัญญาณ"]
     
     close = df['Close']
     
@@ -208,23 +238,52 @@ def analyze_market(df):
     if (prev_ema_fast <= prev_ema_slow and current_ema_fast > current_ema_slow):
         if 30 < current_rsi < 70:
             if current_close > current_ema_fast:
-                reasons.append("EMA fast crossed above EMA slow")
-                reasons.append(f"RSI neutral zone: {current_rsi:.1f}")
-                reasons.append("Price above fast EMA")
+                reasons.append("เส้น EMA สั้นตัดขึ้นเหนือ EMA ยาว (โมเมนตัมเริ่มเป็นขาขึ้น)")
+                reasons.append(f"RSI อยู่โซนกลาง: {current_rsi:.1f}")
+                reasons.append("ราคายืนเหนือ EMA สั้น")
                 return "BUY", reasons
     
     # SELL conditions
     if (prev_ema_fast >= prev_ema_slow and current_ema_fast < current_ema_slow):
         if 30 < current_rsi < 70:
             if current_close < current_ema_fast:
-                reasons.append("EMA fast crossed below EMA slow")
-                reasons.append(f"RSI neutral zone: {current_rsi:.1f}")
-                reasons.append("Price below fast EMA")
+                reasons.append("เส้น EMA สั้นตัดลงใต้ EMA ยาว (โมเมนตัมเริ่มเป็นขาลง)")
+                reasons.append(f"RSI อยู่โซนกลาง: {current_rsi:.1f}")
+                reasons.append("ราคาอยู่ใต้ EMA สั้น")
                 return "SELL", reasons
     
     # NO TRADE
-    reasons.append("No clear setup detected")
+    reasons.append("ยังไม่เจอสัญญาณที่ชัดเจน")
     return "NO TRADE", reasons
+
+
+def build_entry_telegram_message(symbol, timeframe_minutes, signal, params, reasons):
+    direction = "Buy" if signal == "BUY" else "Sell"
+    lines = [
+        "แจ้งเตือนเข้าเทรด",
+        f"{symbol} ฝั่ง {direction}",
+        f"กรอบเวลา: M{timeframe_minutes}",
+        "",
+        f"จุดเข้า: {params['entry']}",
+        f"SL (จุดตัดขาดทุน): {params['sl']}",
+        f"TP (เป้ากำไร): {params['tp']}",
+        f"RR: {params['rr']}",
+        "",
+        "เหตุผล:",
+    ]
+    for r in reasons[:3]:
+        lines.append(f"- {r}")
+    lines += [
+        "",
+        "ก่อนเข้า ควรดูเพิ่ม:",
+        "- ราคาไม่สวนกลับแรงในแท่งล่าสุด",
+        "- สเปรด/ค่าคอมฯ ไม่กว้างผิดปกติ",
+        "- ถ้าราคาแกว่งแรง ให้รอแท่งยืนยันก่อนค่อยเข้า",
+        "",
+        "สิ่งที่ควรทำ:",
+        "- ตั้งขนาดไม้ให้รับความเสี่ยงได้ และยึดตาม SL/TP ตามแผน",
+    ]
+    return "\n".join(lines)
 
 
 def compute_trade_params(df, signal):
@@ -304,17 +363,8 @@ def generate_signal():
     log_signal(signal_data)
     
     # Build Telegram message
-    message = f"🔔 *SIGNAL ALERT*\n\n"
-    message += f"Symbol: {SYMBOL}\n"
-    message += f"Signal: *{signal}*\n"
-    message += f"Entry: {params['entry']}\n"
-    message += f"Stop Loss: {params['sl']}\n"
-    message += f"Take Profit: {params['tp']}\n"
-    message += f"Risk/Reward: {params['rr']}\n\n"
-    message += f"Reasons:\n"
-    for r in reasons:
-        message += f"  • {r}\n"
-    message += f"\n⚠️ Manual execution required"
+    message = build_entry_telegram_message(SYMBOL, TIMEFRAME_MINUTES, signal, params, reasons)
+    message = build_telegram_message(message)
     
     if TELEGRAM_ENABLED:
         send_telegram_message(message)

@@ -21,6 +21,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # SEND MESSAGE
 # ==============================================================================
 
+def build_telegram_message(message):
+    return message
+
+
 def send_telegram_message(message):
     """
     Send a message via Telegram Bot API.

@@ -8,6 +8,7 @@
 import json
 import os
 import sys
+from pathlib import Path
 from datetime import datetime, timezone
 import time
 
@@ -25,15 +26,38 @@ try:
 except ImportError:
     YFINANCE_AVAILABLE = False
 
-from telegram_notifier import send_telegram_message
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+try:
+    from core.structure_engine import evaluate_entry_state
+except Exception:
+    evaluate_entry_state = None
+
+try:
+    from core.dashboard_state_writer import update_dashboard_state
+except Exception:
+    try:
+        from dashboard_state_writer import update_dashboard_state
+    except Exception:
+        update_dashboard_state = None
+
+from telegram_notifier import build_telegram_message, send_telegram_message
 
 
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 
-ACTIVE_TRADE_FILE = "runtime/active_trade.json"
-MT5_SYMBOL = "XAUUSD"
+PROJECT_ROOT = Path(__file__).resolve().parent
+RUNTIME_DIR = PROJECT_ROOT / "runtime"
+DASHBOARD_STATE_PATH = RUNTIME_DIR / "dashboard_state.json"
+
+ACTIVE_TRADE_FILE = RUNTIME_DIR / "active_trade.json"
 TELEGRAM_ENABLED = True
 
 
@@ -63,14 +87,20 @@ def log_monitor(monitor_data):
 # MARKET DATA
 # ==============================================================================
 
-def get_current_price_mt5():
+def get_current_price_mt5(symbol):
     """Fetch current price via MT5."""
     if not mt5.initialize():
         log_system("ERROR: MT5 initialization failed")
         return None
     
-    tick = mt5.symbol_info_tick(MT5_SYMBOL)
-    mt5.shutdown()
+    try:
+        if not mt5.symbol_select(symbol, True):
+            log_system(f"ERROR: MT5 ไม่สามารถเลือกสัญลักษณ์ได้: {symbol}")
+            return None
+
+        tick = mt5.symbol_info_tick(symbol)
+    finally:
+        mt5.shutdown()
     
     if tick is None:
         log_system("ERROR: MT5 returned no tick data")
@@ -79,7 +109,7 @@ def get_current_price_mt5():
     return tick.bid
 
 
-def get_current_price_fallback():
+def get_current_price_fallback(symbol):
     """Fallback: fetch current price via yfinance."""
     if not YFINANCE_AVAILABLE:
         log_system("ERROR: yfinance not available for fallback")
@@ -97,16 +127,16 @@ def get_current_price_fallback():
         return None
 
 
-def get_current_price():
+def get_current_price(symbol):
     """Main entry point for current price."""
     if MT5_AVAILABLE:
-        price = get_current_price_mt5()
+        price = get_current_price_mt5(symbol)
         if price is not None:
             return price
         log_system("MT5 price fetch failed, trying fallback")
     
     if YFINANCE_AVAILABLE:
-        return get_current_price_fallback()
+        return get_current_price_fallback(symbol)
     
     log_system("ERROR: No price source available")
     return None
@@ -122,13 +152,40 @@ def load_active_trade():
         return None
     
     try:
-        with open(ACTIVE_TRADE_FILE, "r") as f:
-            trade = json.load(f)
-        
-        if not trade.get("active", False):
+        with open(ACTIVE_TRADE_FILE, "r", encoding="utf-8-sig") as f:
+            raw = f.read().strip()
+
+        if not raw:
             return None
-        
-        return trade
+
+        trade = None
+        try:
+            trade = json.loads(raw)
+        except json.JSONDecodeError:
+            decoder = json.JSONDecoder()
+            idx = 0
+            objs = []
+            while idx < len(raw):
+                while idx < len(raw) and raw[idx].isspace():
+                    idx += 1
+                if idx >= len(raw):
+                    break
+                try:
+                    obj, end = decoder.raw_decode(raw, idx)
+                except json.JSONDecodeError:
+                    break
+                objs.append(obj)
+                idx = end
+            if objs:
+                trade = objs[-1]
+
+        if not isinstance(trade, dict):
+            return None
+
+        if trade.get("active", False):
+            return trade
+
+        return None
     except Exception as e:
         log_system(f"ERROR loading active trade: {e}")
         return None
@@ -174,58 +231,135 @@ def evaluate_trade(trade, current_price):
     
     # EXIT NOW conditions
     if side == "BUY" and current_price <= sl:
-        reasons.append("Stop loss hit")
+        reasons.append("ราคาแตะจุดตัดขาดทุน (SL)")
         return "EXIT NOW", reasons, pnl_points
     
     if side == "SELL" and current_price >= sl:
-        reasons.append("Stop loss hit")
+        reasons.append("ราคาแตะจุดตัดขาดทุน (SL)")
         return "EXIT NOW", reasons, pnl_points
     
     # Reversal detection (simple momentum check)
     if pnl_pct_of_reward > 40:  # In profit zone
         if side == "BUY" and pnl_points < reward_points * 0.3:
-            # Was in good profit, now retracing significantly
-            reasons.append("Significant retracement from peak")
-            reasons.append(f"Profit reduced to {pnl_pct_of_reward:.1f}% of target")
+            reasons.append("กำไรย่อกลับแรงหลังจากเคยไปต่อได้ดี")
+            reasons.append(f"ตอนนี้เหลือประมาณ {pnl_pct_of_reward:.1f}% ของเป้าหมาย")
             return "EXIT NOW", reasons, pnl_points
         
         if side == "SELL" and pnl_points < reward_points * 0.3:
-            reasons.append("Significant retracement from peak")
-            reasons.append(f"Profit reduced to {pnl_pct_of_reward:.1f}% of target")
+            reasons.append("กำไรย่อกลับแรงหลังจากเคยไปต่อได้ดี")
+            reasons.append(f"ตอนนี้เหลือประมาณ {pnl_pct_of_reward:.1f}% ของเป้าหมาย")
             return "EXIT NOW", reasons, pnl_points
     
     # TAKE SMALL PROFIT conditions
     if pnl_pct_of_risk >= 50 and pnl_pct_of_reward < 60:
-        # Decent profit but not near target, and showing weakness
-        reasons.append(f"Profit at {pnl_pct_of_risk:.1f}% of risk")
-        reasons.append("Target not reached but profit secured")
+        reasons.append(f"กำไรประมาณ {pnl_pct_of_risk:.1f}% เมื่อเทียบกับความเสี่ยง (R)")
+        reasons.append("ยังไม่ถึงเป้า แต่เริ่มมีสัญญาณชะลอ ควรล็อกกำไรบางส่วน")
         return "TAKE SMALL PROFIT", reasons, pnl_points
     
     # WATCH CLOSELY conditions
     if pnl_pct_of_risk > 20 and pnl_pct_of_risk < 50:
-        reasons.append(f"In profit: {pnl_pct_of_risk:.1f}% of risk")
-        reasons.append("Monitor for reversal signs")
+        reasons.append(f"เริ่มมีกำไร: {pnl_pct_of_risk:.1f}% ของความเสี่ยง (R)")
+        reasons.append("เฝ้าดูว่าราคาจะกลับตัวหรือไม่")
         return "WATCH CLOSELY", reasons, pnl_points
     
     if pnl_pct_of_risk < 0 and pnl_pct_of_risk > -50:
-        reasons.append(f"Small drawdown: {pnl_pct_of_risk:.1f}% of risk")
-        reasons.append("Watch for setup invalidation")
+        reasons.append(f"ติดลบเล็กน้อย: {pnl_pct_of_risk:.1f}% ของความเสี่ยง (R)")
+        reasons.append("ดูว่าราคาเริ่มผิดทางจนทำให้แผนเสียหรือยัง")
         return "WATCH CLOSELY", reasons, pnl_points
     
     if pnl_pct_of_risk < -50:
-        reasons.append(f"Approaching stop: {pnl_pct_of_risk:.1f}% of risk")
-        reasons.append("Prepare for stop loss")
+        reasons.append(f"เริ่มเข้าใกล้ SL: {pnl_pct_of_risk:.1f}% ของความเสี่ยง (R)")
+        reasons.append("เตรียมรับมือ ถ้าหลุดจุดสำคัญให้ยอมออกตามแผน")
         return "WATCH CLOSELY", reasons, pnl_points
     
     # HOLD conditions (default)
     if pnl_pct_of_reward >= 80:
-        reasons.append(f"Near target: {pnl_pct_of_reward:.1f}% of TP")
-        reasons.append("Consider taking profit manually")
+        reasons.append(f"ใกล้เป้ากำไร: {pnl_pct_of_reward:.1f}% ของ TP")
+        reasons.append("พิจารณาทยอยปิดกำไรเพื่อไม่ให้กำไรหาย")
     else:
-        reasons.append("Trade progressing normally")
-        reasons.append(f"P&L: {pnl_pct_of_risk:.1f}% of risk")
+        reasons.append("ราคายังเดินตามแผนโดยรวม")
+        reasons.append(f"P&L ตอนนี้: {pnl_pct_of_risk:.1f}% ของความเสี่ยง (R)")
     
     return "HOLD", reasons, pnl_points
+
+
+def get_thai_action(status):
+    return {
+        "HOLD": "ถือต่อ",
+        "WATCH CLOSELY": "ระวังใกล้ชิด",
+        "TAKE SMALL PROFIT": "ทยอยปิดกำไร",
+        "EXIT NOW": "ควรออกก่อน",
+    }.get(status, "ระวังใกล้ชิด")
+
+
+def build_monitor_telegram_message(trade, current_price, status, reasons, pnl_points):
+    direction = "Buy" if trade["side"] == "BUY" else "Sell"
+    action = get_thai_action(status)
+    entry = trade["entry_price"]
+    sl = trade["sl"]
+    tp = trade["tp"]
+
+    if trade["side"] == "BUY":
+        to_tp = tp - current_price
+        to_sl = current_price - sl
+        price_now = (
+            "ราคายืนเหนือจุดเข้า ยังพอไปต่อได้"
+            if current_price >= entry
+            else "ราคาหลุดต่ำกว่าจุดเข้า โมเมนตัมเริ่มอ่อน"
+        )
+        momentum_now = "โมเมนตัมยังสนับสนุนฝั่ง Buy" if pnl_points > 0 else "โมเมนตัมฝั่ง Buy อ่อนลง ควรระวัง"
+    else:
+        to_tp = current_price - tp
+        to_sl = sl - current_price
+        price_now = (
+            "ราคาลงต่ำกว่าจุดเข้า ยังพอไปต่อได้"
+            if current_price <= entry
+            else "ราคาดันกลับเหนือจุดเข้า โมเมนตัมเริ่มอ่อน"
+        )
+        momentum_now = "โมเมนตัมยังสนับสนุนฝั่ง Sell" if pnl_points > 0 else "โมเมนตัมฝั่ง Sell อ่อนลง ควรระวัง"
+
+    if status == "EXIT NOW":
+        price_now = "ราคาไปผิดทาง/หลุดจุดสำคัญแล้ว"
+        momentum_now = "โมเมนตัมเสีย ควรลดความเสี่ยงทันที"
+    elif status == "TAKE SMALL PROFIT":
+        momentum_now = "ยังมีกำไร แต่แรงเริ่มชะลอ เหมาะกับการล็อกกำไรบางส่วน"
+
+    lines = [
+        "อัปเดตการเฝ้าไม้",
+        f"{trade['symbol']} ฝั่ง {direction}",
+        "",
+        "สถานะ",
+        f"- {action}",
+        "",
+        "ราคา",
+        f"- ราคาปัจจุบัน: {current_price:.2f}",
+        f"- จุดเข้า: {entry} | SL: {sl} | TP: {tp}",
+        "",
+        "ภาพรวมตอนนี้",
+        f"- {price_now}",
+        f"- {momentum_now}",
+        "",
+        "เหตุผล",
+    ]
+    for r in reasons[:3]:
+        lines.append(f"- {r}")
+
+    watch_lines = []
+    if to_sl is not None:
+        if to_sl <= 0:
+            watch_lines.append("- ราคาอยู่ใกล้ SL มาก ให้เข้มงวดตามแผน")
+        else:
+            watch_lines.append(f"- ระยะถึง SL ประมาณ {abs(to_sl):.2f} จุด")
+    if to_tp is not None:
+        watch_lines.append(f"- ระยะถึง TP ประมาณ {abs(to_tp):.2f} จุด")
+
+    lines += [
+        "",
+        "สิ่งที่ควรทำ",
+        f"- {action}",
+    ]
+    lines += watch_lines[:2]
+    return "\n".join(lines)
 
 
 # ==============================================================================
@@ -242,7 +376,7 @@ def monitor_cycle():
     
     log_system(f"Monitoring active {trade['side']} trade on {trade['symbol']}")
     
-    current_price = get_current_price()
+    current_price = get_current_price(trade["symbol"])
     
     if current_price is None:
         log_system("ERROR: Failed to fetch current price")
@@ -268,25 +402,8 @@ def monitor_cycle():
     
     # Send Telegram alert for important statuses
     if status in ["WATCH CLOSELY", "TAKE SMALL PROFIT", "EXIT NOW"]:
-        emoji_map = {
-            "WATCH CLOSELY": "👀",
-            "TAKE SMALL PROFIT": "💰",
-            "EXIT NOW": "🚨"
-        }
-        
-        emoji = emoji_map.get(status, "📊")
-        
-        message = f"{emoji} *TRADE ALERT*\n\n"
-        message += f"Symbol: {trade['symbol']}\n"
-        message += f"Side: {trade['side']}\n"
-        message += f"Status: *{status}*\n"
-        message += f"Current Price: {current_price:.2f}\n"
-        message += f"Entry: {trade['entry_price']}\n"
-        message += f"P&L Points: {pnl_points:+.2f}\n\n"
-        message += f"Reasons:\n"
-        for r in reasons:
-            message += f"  • {r}\n"
-        message += f"\n⚠️ Manual action required"
+        message = build_monitor_telegram_message(trade, current_price, status, reasons, pnl_points)
+        message = build_telegram_message(message)
         
         if TELEGRAM_ENABLED:
             send_telegram_message(message)

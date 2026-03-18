@@ -18,8 +18,10 @@ PivotSide = Literal["HIGH", "LOW"]
 
 PIVOT_LEFT = 2
 PIVOT_RIGHT = 2
-REACTION_WINDOW_BARS = 3
+REACTION_WINDOW_BARS = 6
 BREAK_METHOD = "close_only"
+TESTING_ZONE_PENALTY = 0.03
+STALL_OUTSIDE_ZONE_PENALTY = 0.10
 
 
 @dataclass(frozen=True)
@@ -200,7 +202,7 @@ def _last_pivot_after(swings: dict[str, Any], kind: PivotSide, after_index: int)
 
 
 def detect_bos(df: pd.DataFrame, swings: dict[str, Any], choch_state: dict[str, Any]) -> dict[str, Any]:
-    if df is None or len(df) < 10 or not _has_columns(df):
+    if df is None or len(df) < 8 or not _has_columns(df):
         return {
             "state": "NONE",
             "direction": "NONE",
@@ -292,7 +294,7 @@ def detect_bos(df: pd.DataFrame, swings: dict[str, Any], choch_state: dict[str, 
 
 
 def map_order_block(df: pd.DataFrame, bos_state: dict[str, Any]) -> dict[str, Any]:
-    if df is None or len(df) < 10 or not _has_columns(df):
+    if df is None or len(df) < 8 or not _has_columns(df):
         return {
             "state": "NONE",
             "direction": "NONE",
@@ -345,12 +347,19 @@ def map_order_block(df: pd.DataFrame, bos_state: dict[str, Any]) -> dict[str, An
     lows = df["Low"].reset_index(drop=True)
 
     ob_index: int | None = None
+    has_fvg = False
 
     if bos_dir == "BULLISH":
         for i in range(end - 1, start - 1, -1):
             if _safe_float(closes.iloc[i]) is None or _safe_float(opens.iloc[i]) is None:
                 continue
             if float(closes.iloc[i]) < float(opens.iloc[i]):
+                # Check for FVG (Imbalance) after the OB
+                if i + 2 < len(df):
+                    ob_high_val = float(highs.iloc[i])
+                    third_candle_low = float(lows.iloc[i + 2])
+                    if third_candle_low > ob_high_val:
+                        has_fvg = True
                 ob_index = int(i)
                 break
     else:
@@ -358,10 +367,16 @@ def map_order_block(df: pd.DataFrame, bos_state: dict[str, Any]) -> dict[str, An
             if _safe_float(closes.iloc[i]) is None or _safe_float(opens.iloc[i]) is None:
                 continue
             if float(closes.iloc[i]) > float(opens.iloc[i]):
+                # Check for FVG (Imbalance) after the OB
+                if i + 2 < len(df):
+                    ob_low_val = float(lows.iloc[i])
+                    third_candle_high = float(highs.iloc[i + 2])
+                    if third_candle_high < ob_low_val:
+                        has_fvg = True
                 ob_index = int(i)
                 break
 
-    if ob_index is None:
+    if ob_index is None or not has_fvg:
         return {
             "state": "NONE",
             "direction": bos_dir,
@@ -395,7 +410,7 @@ def map_order_block(df: pd.DataFrame, bos_state: dict[str, Any]) -> dict[str, An
 
 
 def evaluate_reaction(df: pd.DataFrame, ob_state: dict[str, Any]) -> dict[str, Any]:
-    if df is None or len(df) < 10 or not _has_columns(df):
+    if df is None or len(df) < 8 or not _has_columns(df):
         return {
             "state": "NONE",
             "direction": "NONE",
@@ -481,15 +496,33 @@ def evaluate_reaction(df: pd.DataFrame, ob_state: dict[str, Any]) -> dict[str, A
     if direction == "BULLISH":
         for i in range(touch_index, min(last_index, expires_at) + 1):
             c = _safe_float(closes.iloc[i])
-            if c is not None and c > ob_high:
-                valid = True
-                break
+            lo = _safe_float(lows.iloc[i])
+            hi = _safe_float(highs.iloc[i])
+            
+            # Rejection condition: price dipped into OB but closed above OB_LOW (leaving a wick)
+            # or closed aggressively above OB_HIGH
+            if c is not None and lo is not None:
+                if c >= ob_low and lo <= ob_low: # Wick rejection at bottom of OB
+                    valid = True
+                    break
+                if c > ob_high: # Strong structural rejection
+                    valid = True
+                    break
     else:
         for i in range(touch_index, min(last_index, expires_at) + 1):
             c = _safe_float(closes.iloc[i])
-            if c is not None and c < ob_low:
-                valid = True
-                break
+            lo = _safe_float(lows.iloc[i])
+            hi = _safe_float(highs.iloc[i])
+            
+            # Rejection condition: price spiked into OB but closed below OB_HIGH (leaving a wick)
+            # or closed aggressively below OB_LOW
+            if c is not None and hi is not None:
+                if c <= ob_high and hi >= ob_high: # Wick rejection at top of OB
+                    valid = True
+                    break
+                if c < ob_low: # Strong structural rejection
+                    valid = True
+                    break
 
     return {
         "state": "VALID" if valid else "WATCHING",
@@ -524,13 +557,26 @@ def _detect_invalidation(df: pd.DataFrame, ob_state: dict[str, Any]) -> dict[str
     return {"level": level, "broken": bool(last_close > level), "method": BREAK_METHOD}
 
 
-def evaluate_entry_state(df: pd.DataFrame) -> dict[str, Any]:
+def evaluate_entry_state(df: pd.DataFrame, df_htf: pd.DataFrame | None = None) -> dict[str, Any]:
     swings = detect_swings(df)
     choch = detect_choch(df, swings)
     bos = detect_bos(df, swings, choch)
     order_block = map_order_block(df, bos)
     reaction = evaluate_reaction(df, order_block)
     invalidation = _detect_invalidation(df, order_block)
+
+    # MTF Alignment (H1 Trend Check)
+    htf_bias = "NEUTRAL"
+    if df_htf is not None and len(df_htf) > 0 and _has_columns(df_htf):
+        htf_swings = detect_swings(df_htf)
+        htf_choch = detect_choch(df_htf, htf_swings)
+        htf_bos = detect_bos(df_htf, htf_swings, htf_choch)
+        
+        # Determine HTF Bias
+        if htf_bos.get("state") == "BULLISH_CONFIRMED" or htf_choch.get("state") == "BULLISH_CONFIRMED":
+            htf_bias = "BULLISH"
+        elif htf_bos.get("state") == "BEARISH_CONFIRMED" or htf_choch.get("state") == "BEARISH_CONFIRMED":
+            htf_bias = "BEARISH"
 
     trigger_stack: list[str] = []
     entry_state = "IDLE"
@@ -549,23 +595,43 @@ def evaluate_entry_state(df: pd.DataFrame) -> dict[str, Any]:
         trigger_stack.append("BOS")
         entry_state = "CONFIRMED"
 
-    if order_block.get("state") == "MAPPED":
-        trigger_stack.append("OB")
-
-    if order_block.get("state") == "MAPPED" and reaction.get("state") == "WAITING":
-        entry_state = "CONFIRMED"
-    elif order_block.get("state") == "MAPPED" and reaction.get("touched") and not reaction.get("valid"):
-        entry_state = "ZONE_READY" if reaction.get("state") != "EXPIRED" else "INVALIDATED"
-    elif order_block.get("state") == "MAPPED" and reaction.get("valid"):
-        trigger_stack.append("REACTION")
-        entry_state = "ACTIONABLE"
-
-    if invalidation.get("broken") and order_block.get("state") == "MAPPED" and entry_state != "ACTIONABLE":
+    # Filter out setups that oppose HTF Bias
+    if bias != "NEUTRAL" and htf_bias != "NEUTRAL" and bias != htf_bias:
+        # Invalidated because it's trading against the HTF trend
         entry_state = "INVALIDATED"
+        trigger_stack.append("MTF_CONFLICT")
+    else:
+        if htf_bias != "NEUTRAL":
+            trigger_stack.append("MTF_ALIGNED")
+            
+        if order_block.get("state") == "MAPPED":
+            trigger_stack.append("OB")
+
+        if order_block.get("state") == "MAPPED" and reaction.get("state") == "WAITING":
+            entry_state = "CONFIRMED"
+        elif order_block.get("state") == "MAPPED" and reaction.get("touched") and not reaction.get("valid"):
+            entry_state = "ZONE_READY" if reaction.get("state") != "EXPIRED" else "INVALIDATED"
+        elif order_block.get("state") == "MAPPED" and reaction.get("valid"):
+            trigger_stack.append("REACTION")
+            entry_state = "ACTIONABLE"
+
+        if invalidation.get("broken") and order_block.get("state") == "MAPPED":
+            entry_state = "INVALIDATED"
+
+    entry_phase = {
+        "EARLY": "SETUP",
+        "CONFIRMED": "SETUP",
+        "ZONE_READY": "READY",
+        "ACTIONABLE": "ACTIONABLE",
+        "INVALIDATED": "INVALIDATED",
+        "IDLE": "IDLE",
+    }.get(entry_state, "IDLE")
 
     return {
         "entry_state": entry_state,
+        "entry_phase": entry_phase,
         "bias": bias,
+        "htf_bias": htf_bias,
         "swings": swings,
         "choch": choch,
         "bos": bos,
@@ -691,7 +757,7 @@ def evaluate_trade_structure_health(df: pd.DataFrame, active_trade: dict[str, An
             in_zone = (current_price >= ob_low) and (current_price <= ob_high)
             if in_zone:
                 zone_reaction = "TESTING"
-                score -= 0.20
+                score -= TESTING_ZONE_PENALTY
             elif current_price > ob_high:
                 zone_reaction = "HOLDING"
             else:
@@ -702,7 +768,7 @@ def evaluate_trade_structure_health(df: pd.DataFrame, active_trade: dict[str, An
             in_zone = (current_price >= ob_low) and (current_price <= ob_high)
             if in_zone:
                 zone_reaction = "TESTING"
-                score -= 0.20
+                score -= TESTING_ZONE_PENALTY
             elif current_price < ob_low:
                 zone_reaction = "HOLDING"
             else:
@@ -715,7 +781,8 @@ def evaluate_trade_structure_health(df: pd.DataFrame, active_trade: dict[str, An
         else:
             continuation = "GOOD" if current_price < entry_price else "STALL"
         if continuation == "STALL":
-            score -= 0.15
+            if zone_reaction != "TESTING":
+                score -= STALL_OUTSIDE_ZONE_PENALTY
 
     if ob_integrity == "BROKEN":
         score -= 0.35
@@ -800,4 +867,3 @@ __all__ = [
     "evaluate_entry_state",
     "evaluate_trade_structure_health",
 ]
-

@@ -1,0 +1,527 @@
+STATE DIAGRAM — ALERT_BOT PRODUCTION STRUCTURE MONITOR v1
+Version: v1.0.0
+Project: Alert_bot
+Mode: Production Only
+Scope: Entry Structure Engine + Trade Monitor + Exit Engine + Dashboard State + Telegram Explainer
+
+======================================================================
+1) SYSTEM OVERVIEW
+======================================================================
+
+[START]
+   |
+   v
+[BOOTSTRAP]
+   |
+   +--> load config/runtime paths
+   +--> load MT5 connection
+   +--> prepare runtime/dashboard_state.json
+   +--> prepare runtime/active_trade.json
+   |
+   v
+[RUN MODE SPLIT]
+   |
+   +--> [ENTRY RUNTIME: main.py]
+   |
+   +--> [MONITOR RUNTIME: trade_monitor.py]
+
+Both runtimes write to:
+   runtime/dashboard_state.json
+
+Dashboard reads from:
+   runtime/dashboard_state.json
+
+Telegram messages come from:
+   telegram_notifier.py
+
+
+======================================================================
+2) ENTRY RUNTIME STATE DIAGRAM (main.py)
+======================================================================
+
+[ENTRY_IDLE]
+   |
+   +--> condition:
+   |    - market data loaded
+   |    - no valid structure trigger yet
+   |
+   +--> output:
+   |    - entry_lifecycle.state = IDLE
+   |    - bias = NEUTRAL or current structure bias
+   |    - no actionable trigger
+   |
+   v
+[EARLY]
+   |
+   +--> trigger:
+   |    - CHOCH detected
+   |    - BOS not confirmed yet
+   |
+   +--> meaning:
+   |    - early structure shift
+   |    - not ready for manual entry
+   |
+   +--> output:
+   |    - entry_lifecycle.state = EARLY
+   |    - event_stream append early structure message
+   |    - Telegram early alert (Thai)
+   |
+   v
+[CONFIRMED]
+   |
+   +--> trigger:
+   |    - CHOCH confirmed
+   |    - BOS confirmed
+   |    - valid swing + valid break
+   |
+   +--> meaning:
+   |    - structure direction is now confirmed
+   |    - wait for valid OB
+   |
+   +--> output:
+   |    - entry_lifecycle.state = CONFIRMED
+   |    - market_structure updated
+   |    - event_stream append confirmed structure message
+   |    - Telegram confirmed alert
+   |
+   v
+[ZONE_READY]
+   |
+   +--> trigger:
+   |    - CHOCH + BOS already valid
+   |    - valid OB mapped from latest BOS impulse
+   |
+   +--> meaning:
+   |    - zone exists
+   |    - wait for price reaction inside zone
+   |
+   +--> output:
+   |    - entry_lifecycle.state = ZONE_READY
+   |    - active_ob_low / active_ob_high updated
+   |    - event_stream append zone-ready message
+   |    - Telegram zone-ready alert
+   |
+   v
+[ACTIONABLE]
+   |
+   +--> trigger:
+   |    - price enters valid OB
+   |    - valid reaction occurs within reaction window
+   |    - structure still valid
+   |
+   +--> meaning:
+   |    - manual entry can be considered
+   |
+   +--> output:
+   |    - entry_lifecycle.state = ACTIONABLE
+   |    - invalidation assigned
+   |    - trigger_stack populated
+   |    - event_stream append actionable message
+   |    - Telegram actionable alert
+   |
+   v
+[INVALIDATED]
+   |
+   +--> trigger:
+   |    - opposite CHOCH/BOS appears before completion
+   |    - OB fails
+   |    - structure premise breaks
+   |
+   +--> meaning:
+   |    - setup cancelled
+   |
+   +--> output:
+   |    - entry_lifecycle.state = INVALIDATED
+   |    - event_stream append invalidated message
+   |    - Telegram invalidated alert
+   |
+   +--> transition:
+        -> back to ENTRY_IDLE
+
+
+======================================================================
+3) ENTRY LOGIC FLOW
+======================================================================
+
+[LOAD MARKET DATA]
+   |
+   v
+[DETECT SWINGS]
+   |
+   v
+[DETECT CHOCH]
+   |
+   +--> no CHOCH  -> [IDLE]
+   |
+   +--> yes CHOCH -> [EARLY]
+                       |
+                       v
+                 [DETECT BOS]
+                       |
+                       +--> no BOS  -> remain [EARLY]
+                       |
+                       +--> yes BOS -> [CONFIRMED]
+                                        |
+                                        v
+                                  [MAP ORDER BLOCK]
+                                        |
+                                        +--> no valid OB  -> remain [CONFIRMED]
+                                        |
+                                        +--> valid OB     -> [ZONE_READY]
+                                                              |
+                                                              v
+                                                        [EVALUATE REACTION]
+                                                              |
+                                                              +--> no valid reaction -> remain [ZONE_READY]
+                                                              |
+                                                              +--> valid reaction    -> [ACTIONABLE]
+                                                              |
+                                                              +--> premise broken    -> [INVALIDATED]
+
+
+======================================================================
+4) MANUAL TRADE HANDOFF
+======================================================================
+
+[ACTIONABLE]
+   |
+   +--> trader manually enters trade outside the bot
+   |
+   +--> runtime/active_trade.json is created or updated with:
+   |    - active = true
+   |    - symbol
+   |    - side
+   |    - entry_price
+   |    - entry_time
+   |    - sl
+   |    - tp
+   |    - invalidation
+   |    - active_ob_low
+   |    - active_ob_high
+   |    - setup_context.entry_state = ACTIONABLE
+   |    - setup_context.choch
+   |    - setup_context.bos
+   |
+   v
+[MONITOR HANDOFF COMPLETE]
+
+
+======================================================================
+5) MONITOR RUNTIME STATE DIAGRAM (trade_monitor.py)
+======================================================================
+
+[NO_ACTIVE_TRADE]
+   |
+   +--> condition:
+   |    - runtime/active_trade.json missing
+   |    - or active = false
+   |
+   +--> output:
+   |    - no monitor state
+   |    - dashboard stays on entry-only state
+   |
+   v
+[ENTERED]
+   |
+   +--> condition:
+   |    - active_trade loaded successfully
+   |    - symbol + side + entry_price available
+   |
+   +--> output:
+   |    - monitor begins
+   |    - current price loaded
+   |    - initial trade health computed
+   |
+   v
+[HEALTHY]
+   |
+   +--> trigger:
+   |    - premise valid
+   |    - opposite structure absent
+   |    - continuation acceptable
+   |    - invalidation intact
+   |
+   +--> output:
+   |    - trade_health.trade_state = HEALTHY
+   |    - header.position_state = HEALTHY
+   |    - event_stream append healthy monitor event
+   |    - Telegram monitor update (Thai) if enabled
+   |
+   v
+[WEAKENING]
+   |
+   +--> trigger:
+   |    - continuation weakens
+   |    - reaction weak
+   |    - premise still not fully broken
+   |
+   +--> output:
+   |    - trade_state = WEAKENING
+   |    - exit_risk increases
+   |    - event_stream append weakening event
+   |    - Telegram weakening warning
+   |
+   v
+[DEFENSIVE_EXIT]
+   |
+   +--> trigger:
+   |    - premise degrades materially
+   |    - internal structure weakens
+   |    - risk of reversal increases
+   |
+   +--> output:
+   |    - trade_state = DEFENSIVE_EXIT
+   |    - next_action = defensive response
+   |    - event_stream append defensive exit warning
+   |    - Telegram defensive exit warning
+   |
+   v
+[HARD_EXIT]
+   |
+   +--> trigger:
+   |    - invalidation broken
+   |    - opposite CHOCH/BOS appears
+   |    - structure flips against active trade
+   |
+   +--> output:
+   |    - trade_state = HARD_EXIT
+   |    - exit_engine.exit_state = HARD_EXIT or critical equivalent
+   |    - event_stream append hard exit event
+   |    - Telegram hard exit alert
+   |
+   v
+[CLOSED]
+   |
+   +--> trigger:
+   |    - trader manually exits trade
+   |    - active_trade.json removed or active=false
+   |
+   +--> output:
+   |    - monitor ends
+   |    - dashboard position state returns to neutral/idle
+   |
+   +--> transition:
+        -> [NO_ACTIVE_TRADE]
+
+
+======================================================================
+6) MONITOR LOGIC FLOW
+======================================================================
+
+[LOAD active_trade.json]
+   |
+   +--> missing/invalid -> [NO_ACTIVE_TRADE]
+   |
+   +--> valid -> [ENTERED]
+                   |
+                   v
+             [LOAD LIVE PRICE / MARKET DATA]
+                   |
+                   v
+             [EVALUATE TRADE STRUCTURE HEALTH]
+                   |
+                   +--> score 0.80 - 1.00 -> [HEALTHY]
+                   |
+                   +--> score 0.60 - 0.79 -> [WEAKENING]
+                   |
+                   +--> score 0.40 - 0.59 -> [DEFENSIVE_EXIT]
+                   |
+                   +--> score < 0.40      -> [HARD_EXIT]
+
+
+======================================================================
+7) DASHBOARD STATE OWNERSHIP
+======================================================================
+
+main.py owns:
+- header (base runtime info)
+- market_structure
+- entry_lifecycle
+- trader_mentor (entry context)
+- event_stream (entry events)
+
+trade_monitor.py owns:
+- header.position_state
+- trade_health
+- structure_monitor
+- exit_engine
+- trader_mentor (monitor context update)
+- event_stream (monitor events)
+
+Shared file:
+- runtime/dashboard_state.json
+
+Important ownership rule:
+- main.py must NOT reset monitor-owned sections every loop
+- trade_monitor.py must NOT destroy entry-owned sections
+
+
+======================================================================
+8) DASHBOARD RENDER FLOW
+======================================================================
+
+[runtime/dashboard_state.json]
+   |
+   v
+[dashboard_terminal.py]
+   |
+   +--> load JSON
+   +--> validate schema / health
+   +--> render panels:
+   |    1. Header
+   |    2. Market Structure
+   |    3. Entry Lifecycle
+   |    4. Trade Health
+   |    5. Structure Monitor
+   |    6. Exit Engine
+   |    7. Trader Mentor
+   |    8. Event Stream
+   |    9. Daily Report
+   |
+   v
+[ENGLISH TERMINAL DASHBOARD OUTPUT]
+
+
+======================================================================
+9) TELEGRAM MESSAGE FLOW
+======================================================================
+
+[ENTRY EVENT]
+   |
+   +--> EARLY
+   +--> CONFIRMED
+   +--> ZONE_READY
+   +--> ACTIONABLE
+   +--> INVALIDATED
+   |
+   v
+[telegram_notifier.py]
+   |
+   +--> build Thai explanatory message:
+   |    - market state
+   |    - what trader should inspect on chart
+   |    - why the system alerted
+   |    - final interpretation
+   |
+   v
+[TELEGRAM SEND]
+
+[MONITOR EVENT]
+   |
+   +--> HEALTHY
+   +--> WEAKENING
+   +--> DEFENSIVE_EXIT
+   +--> HARD_EXIT
+   |
+   v
+[telegram_notifier.py]
+   |
+   +--> build Thai explanatory message
+   |
+   v
+[TELEGRAM SEND]
+
+
+======================================================================
+10) SYSTEM HEALTH STATES
+======================================================================
+
+dashboard writer / dashboard reader can expose:
+
+[NOMINAL]
+- state file valid
+- data current
+
+[STALE]
+- state file exists but not refreshed in expected time window
+
+[DEGRADED]
+- runtime partially working
+- some sections missing/invalid
+
+[MISSING]
+- dashboard_state.json not found
+
+[JSON_ERROR]
+- dashboard_state.json unreadable or malformed
+
+
+======================================================================
+11) CURRENT OBSERVED LIVE STATE (from latest run)
+======================================================================
+
+ENTRY SIDE
+- market_structure.bias = NEUTRAL
+- CHOCH = NONE
+- BOS = NONE
+- entry_lifecycle.state = IDLE
+
+MONITOR SIDE
+- active trade exists
+- side = BUY
+- entry_price = 5020.07
+- current_price = 5020.22
+- pnl_points = 0.15
+- trade_state = HEALTHY
+- exit_engine.invalidation = 4986.98
+
+Interpretation:
+- no new entry setup is active right now
+- existing manually entered BUY trade is being monitored
+- monitor currently judges the trade as HEALTHY
+
+
+======================================================================
+12) MASTER STATE MAP
+======================================================================
+
+ENTRY PIPELINE
+IDLE
+ -> EARLY
+ -> CONFIRMED
+ -> ZONE_READY
+ -> ACTIONABLE
+ -> INVALIDATED
+ -> IDLE
+
+TRADE PIPELINE
+NO_ACTIVE_TRADE
+ -> ENTERED
+ -> HEALTHY
+ -> WEAKENING
+ -> DEFENSIVE_EXIT
+ -> HARD_EXIT
+ -> CLOSED
+ -> NO_ACTIVE_TRADE
+
+SYSTEM PIPELINE
+BOOTSTRAP
+ -> ENTRY RUNTIME ACTIVE
+ -> MONITOR RUNTIME ACTIVE
+ -> DASHBOARD STATE WRITING
+ -> DASHBOARD READING / TELEGRAM ALERTING
+
+
+======================================================================
+13) PRODUCTION RULES LOCKED
+======================================================================
+
+- Production only
+- No demo
+- No mock state
+- No sample loop
+- Human trader executes manually
+- No auto-trade
+- No auto-close
+- Structure-only logic:
+  - Swing
+  - CHOCH
+  - BOS
+  - OB
+  - Reaction
+  - Premise validity
+  - Opposite structure
+- Dashboard language = English
+- Telegram language = Thai
+- Shared runtime state file = runtime/dashboard_state.json
+- Active trade runtime file = runtime/active_trade.json

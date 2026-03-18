@@ -1,0 +1,172 @@
+
+python main.py
+
+
+python trade_monitor.py
+
+
+
+
+python dashboard_terminal.py --live
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+python main.pyใช้สำหรับรันรอบวิเคราะห์/คัด setup หลัก
+
+Remove-Item Env:RUN_POSITION_MONITOR -ErrorAction SilentlyContinue
+$env:RUN_PRODUCTION_RUNTIME="1"
+python app/main.py 
+
+
+
+
+รัน Position Monitor
+
+ใช้สำหรับเฝ้า position ที่เปิดอยู่ และประเมิน exit
+
+Remove-Item Env:RUN_PRODUCTION_RUNTIME -ErrorAction SilentlyContinue
+$env:RUN_POSITION_MONITOR="1"
+python app/main.py
+
+
+
+เปิด Dashboard
+
+ถ้าไฟล์ dashboard ของคุณคือ terminal_dashboard.py ให้รันจาก root project
+
+
+python app/terminal_dashboard.py
+
+
+
+ลำดับใช้งานจริง
+แบบใช้งาน Production Runtime + Dashboard
+
+เปิด 2 หน้าต่าง PowerShell
+
+หน้าต่างที่ 1 — runtime
+
+Remove-Item Env:RUN_POSITION_MONITOR -ErrorAction SilentlyContinue
+$env:RUN_PRODUCTION_RUNTIME="1"
+python app/main.py
+
+หน้าต่างที่ 2 — dashboard
+
+python app/terminal_dashboard.py
+
+
+
+
+ลำดับใช้งานจริง
+แบบใช้งาน Production Runtime + Dashboard
+
+เปิด 2 หน้าต่าง PowerShell
+
+หน้าต่างที่ 1 — runtime
+
+Remove-Item Env:RUN_POSITION_MONITOR -ErrorAction SilentlyContinue
+$env:RUN_PRODUCTION_RUNTIME="1"
+python main.py
+
+หน้าต่างที่ 2 — dashboard
+
+python core/terminal_dashboard.py
+
+
+
+
+ไฟล์ state ที่ dashboard อ่าน
+
+ไฟล์กลางคือ:
+
+runtime/dashboard_state.json
+คำสั่งเช็ค state ตรง ๆ
+Get-Content runtime\dashboard_state.json
+
+
+##################################################################
+สรุปสั้นที่สุด
+
+Production Runtime
+
+Remove-Item Env:RUN_POSITION_MONITOR -ErrorAction SilentlyContinue
+$env:RUN_PRODUCTION_RUNTIME="1"
+python app/main.py
+
+Position Monitor
+
+Remove-Item Env:RUN_PRODUCTION_RUNTIME -ErrorAction SilentlyContinue
+$env:RUN_POSITION_MONITOR="1"
+python app/main.py
+
+Dashboard
+
+python app/terminal_dashboard.py
+
+#######################################################################
+
+
+
+
+
+
+
+ผลลัพธ์ที่ได้:
+
+- อ่าน runtime\active_trade.json
+- โหลดกราฟจริงตาม symbol ในไฟล์ (ไม่ hardcode)
+- ประเมินโครงสร้างหลังเข้า และอัปเดต runtime\dashboard_state.json เฉพาะส่วน monitor-owned:
+  - header.position_state
+  - trade_health
+  - structure_monitor
+  - exit_engine
+  - trader_mentor
+  - event_stream
+- สถานะหลักที่ใช้ใน console/dashboard: HEALTHY / WEAKENING / DEFENSIVE_EXIT / HARD_EXIT
+- ส่ง Telegram ภาษาไทยตามสถานะข้างบน + มี dedup ใน runtime\monitor_telegram_dedup.json
+### 4) เปิด Terminal Dashboard (อังกฤษ)
+```
+python dashboard_terminal.py
+```
+อ่านจาก runtime\dashboard_state.json แล้ว render dashboard แบบ production
+
+### 5) แนวทางรันแบบ “โปรดักชัน”
+- เปิด 3 หน้าต่าง/แท็บ terminal แล้วรันพร้อมกัน:
+  1. python main.py
+  2. python trade_monitor.py
+  3. python dashboard_terminal.py
+- ถ้าต้องการให้รันยาว ๆ แบบ service จริงบน Windows ให้ใช้ Task Scheduler / NSSM เรียกคำสั่งชุดเดียวกัน (แต่ตัวโปรเซสหลักยังเป็น 3 ตัว
+
+
+ความหมายของแต่ละคำสั่ง
+1) python main.py
+
+ใช้ตอนต้องการให้ runtime หลักทำงาน
+
+2) python trade_monitor.py
+
+ใช้ตอนต้องการให้ระบบติดตาม order / exit logic
+
+3) python dashboard_terminal.py
+
+ใช้ตอนต้องการดู snapshot 1 หน้า
+
+4) python dashboard_terminal.py --live
+
+ใช้ตอนต้องการดู dashboard แบบวิ่งต่อเนื่อง

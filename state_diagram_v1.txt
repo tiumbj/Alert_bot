@@ -1,0 +1,519 @@
+[START]
+  |
+  v
+[BOOT SYSTEM]
+  - load runtime
+  - prepare logs
+  - configure stdout / encoding
+  - validate selected symbol
+  |
+  +------------------------------+
+  |                              |
+  v                              v
+[RUN main.py]                [RUN trade_monitor.py]
+  |                              |
+  v                              v
+[SIGNAL ENGINE LOOP]         [MONITOR LOOP]
+
+[MAIN START]
+  |
+  v
+[PRINT STARTUP INFO]
+  - symbol
+  - timeframe
+  - check interval
+  |
+  v
+[VALIDATE SYMBOL]
+  |
+  +--> if symbol not in {GOLD, XAUUSD, XAUUSDm}
+  |        |
+  |        v
+  |    [LOG ERROR]
+  |        |
+  |        v
+  |    [STOP]
+  |
+  v
+[START SIGNAL CYCLE]
+  |
+  v
+[FETCH MARKET DATA FROM MT5]
+  |
+  +--> if MT5 init fail
+  |        |
+  |        v
+  |    [LOG ERROR]
+  |        |
+  |        v
+  |    [TRY FALLBACK]
+  |
+  +--> if symbol select fail
+  |        |
+  |        v
+  |    [LOG ERROR]
+  |        |
+  |        v
+  |    [TRY FALLBACK]
+  |
+  +--> if no bars returned
+  |        |
+  |        v
+  |    [LOG ERROR]
+  |        |
+  |        v
+  |    [TRY FALLBACK]
+  |
+  v
+[MARKET DATA READY]
+  |
+  v
+[COMPUTE INDICATORS]
+  - EMA fast
+  - EMA slow
+  - RSI
+  - ATR
+  |
+  +--> if indicator calculation fail
+  |        |
+  |        v
+  |    [LOG ERROR]
+  |        |
+  |        v
+  |    [END CYCLE]
+  |
+  v
+[CHECK ENTRY CONDITIONS]
+  |
+  +--> if BUY setup
+  |        |
+  |        v
+  |    [BUILD BUY SIGNAL]
+  |      - entry
+  |      - sl
+  |      - tp
+  |      - rr
+  |      - reasons
+  |        |
+  |        v
+  |    [SEND TELEGRAM ALERT]
+  |        |
+  |        v
+  |    [WRITE signals.jsonl]
+  |        |
+  |        v
+  |    [WAIT NEXT CYCLE]
+  |
+  +--> if SELL setup
+  |        |
+  |        v
+  |    [BUILD SELL SIGNAL]
+  |      - entry
+  |      - sl
+  |      - tp
+  |      - rr
+  |      - reasons
+  |        |
+  |        v
+  |    [SEND TELEGRAM ALERT]
+  |        |
+  |        v
+  |    [WRITE signals.jsonl]
+  |        |
+  |        v
+  |    [WAIT NEXT CYCLE]
+  |
+  +--> if no clear setup
+           |
+           v
+      [STATE = NO TRADE]
+           |
+           v
+      [OPTIONAL LOG]
+           |
+           v
+      [WAIT NEXT CYCLE]
+
+      [DATA READY]
+  |
+  v
+[CHECK TREND CONTEXT]
+  |
+  +--> EMA fast > EMA slow
+  |        |
+  |        v
+  |   [BULLISH CONTEXT]
+  |
+  +--> EMA fast < EMA slow
+  |        |
+  |        v
+  |   [BEARISH CONTEXT]
+  |
+  +--> otherwise
+           |
+           v
+      [NO TRADE]
+           |
+           v
+         [END]
+
+[BULLISH CONTEXT]
+  |
+  v
+[CHECK BUY FILTERS]
+  - price above EMA fast
+  - RSI supports buy side
+  - setup still valid
+  |
+  +--> if pass
+  |       |
+  |       v
+  |   [BUY]
+  |
+  +--> if fail
+          |
+          v
+      [NO TRADE]
+
+[BEARISH CONTEXT]
+  |
+  v
+[CHECK SELL FILTERS]
+  - price below EMA fast
+  - RSI supports sell side
+  - setup still valid
+  |
+  +--> if pass
+  |       |
+  |       v
+  |   [SELL]
+  |
+  +--> if fail
+          |
+          v
+      [NO TRADE]
+[NO ACTIVE TRADE]
+  |
+  +--> trader receives BUY/SELL alert
+           |
+           v
+      [TRADER DECISION]
+           |
+           +--> if skip
+           |       |
+           |       v
+           |   [NO ACTIVE TRADE]
+           |
+           +--> if enter manually
+                   |
+                   v
+            [WRITE runtime/active_trade.json]
+                   |
+                   v
+            [ACTIVE TRADE]
+                   |
+                   v
+            [trade_monitor.py starts monitoring]
+
+            [MONITOR START]
+  |
+  v
+[LOAD runtime/active_trade.json]
+  |
+  +--> if file missing
+  |        |
+  |        v
+  |   [WAITING FOR ACTIVE TRADE]
+  |        |
+  |        v
+  |   [SLEEP]
+  |        |
+  |        v
+  |   [LOAD AGAIN]
+  |
+  +--> if JSON invalid
+  |        |
+  |        v
+  |   [LOG ERROR]
+  |        |
+  |        v
+  |   [WAITING FOR ACTIVE TRADE]
+  |
+  +--> if active = false
+  |        |
+  |        v
+  |   [WAITING FOR ACTIVE TRADE]
+  |        |
+  |        v
+  |   [SLEEP]
+  |        |
+  |        v
+  |   [LOAD AGAIN]
+  |
+  +--> if active = true
+           |
+           v
+     [ACTIVE TRADE LOADED]
+           |
+           v
+     [READ symbol / side / entry / sl / tp]
+           |
+           v
+     [FETCH CURRENT PRICE FROM MT5]
+           |
+           +--> if no tick data
+           |        |
+           |        v
+           |   [LOG ERROR]
+           |        |
+           |        v
+           |   [TRY FALLBACK]
+           |        |
+           |        +--> if fallback fail
+           |                 |
+           |                 v
+           |            [LOG ERROR]
+           |                 |
+           |                 v
+           |            [WAIT NEXT MONITOR CYCLE]
+           |
+           v
+     [CURRENT PRICE READY]
+           |
+           v
+     [CALCULATE PNL]
+           |
+           v
+     [EVALUATE TRADE STATE]
+           |
+           +--> if trade healthy
+           |        |
+           |        v
+           |   [STATE = HOLD]
+           |
+           +--> if trade weakening
+           |        |
+           |        v
+           |   [STATE = WATCH CLOSELY]
+           |
+           +--> if profit exists and quality weakens
+           |        |
+           |        v
+           |   [STATE = TAKE SMALL PROFIT]
+           |
+           +--> if invalidation / reversal risk high
+                    |
+                    v
+               [STATE = EXIT NOW]
+                    |
+                    v
+               [SEND TELEGRAM ALERT]
+                    |
+                    v
+               [WRITE monitor.jsonl]
+                    |
+                    v
+               [WAIT NEXT MONITOR CYCLE]
+[ACTIVE TRADE + CURRENT PRICE]
+  |
+  v
+[CALCULATE PNL]
+  |
+  v
+[CHECK SIDE]
+
+========================
+BUY TRADE BRANCH
+========================
+[BUY]
+  |
+  v
+[CHECK IF PRICE STILL SUPPORTS BUY]
+  - current price still above key zone?
+  - not breaking invalidation?
+  - still moving in favorable direction?
+  |
+  +--> if healthy
+  |        |
+  |        v
+  |   [HOLD]
+  |
+  +--> if slowing down
+  |        |
+  |        v
+  |   [WATCH CLOSELY]
+  |
+  +--> if profit already positive and weakening
+  |        |
+  |        v
+  |   [TAKE SMALL PROFIT]
+  |
+  +--> if price breaks invalidation / strong reversal risk
+           |
+           v
+      [EXIT NOW]
+
+========================
+SELL TRADE BRANCH
+========================
+[SELL]
+  |
+  v
+[CHECK IF PRICE STILL SUPPORTS SELL]
+  - current price still below key zone?
+  - not breaking invalidation?
+  - still moving in favorable direction?
+  |
+  +--> if healthy
+  |        |
+  |        v
+  |   [HOLD]
+  |
+  +--> if slowing down
+  |        |
+  |        v
+  |   [WATCH CLOSELY]
+  |
+  +--> if profit already positive and weakening
+  |        |
+  |        v
+  |   [TAKE SMALL PROFIT]
+  |
+  +--> if price breaks invalidation / strong reversal risk
+           |
+           v
+      [EXIT NOW]
+[SIGNAL OR MONITOR EVENT]
+  |
+  v
+[BUILD MESSAGE]
+  |
+  +--> if entry event
+  |        |
+  |        v
+  |   [THAI ENTRY MESSAGE]
+  |   - what happened
+  |   - why signal exists
+  |   - what trader should check
+  |
+  +--> if monitor event
+           |
+           v
+      [THAI MONITOR MESSAGE]
+      - current state
+      - price now
+      - what price is doing
+      - what trader should do next
+  |
+  v
+[SEND TO TELEGRAM]
+  |
+  +--> if send success
+  |        |
+  |        v
+  |   [LOG SUCCESS]
+  |
+  +--> if send fail
+           |
+           v
+      [LOG ERROR]
+[active = false]
+  |
+  +--> trader enters manually
+           |
+           v
+[write active = true]
+  - symbol
+  - side
+  - entry_price
+  - sl
+  - tp
+  - opened_at
+  - timeframe
+  - monitor_interval_sec
+  |
+  v
+[trade_monitor.py monitors]
+  |
+  +--> trader still holding
+  |        |
+  |        v
+  |   [active = true]
+  |
+  +--> trader closes trade manually
+           |
+           v
+      [write active = false]
+           |
+           v
+      [monitor returns to waiting state]
+
+      [RUNNING]
+  |
+  +--> MT5 init fail
+  |        |
+  |        v
+  |   [LOG ERROR]
+  |        |
+  |        v
+  |   [TRY FALLBACK OR WAIT NEXT CYCLE]
+  |
+  +--> no bars returned
+  |        |
+  |        v
+  |   [LOG ERROR]
+  |        |
+  |        v
+  |   [WAIT NEXT CYCLE]
+  |
+  +--> no tick returned
+  |        |
+  |        v
+  |   [LOG ERROR]
+  |        |
+  |        v
+  |   [WAIT NEXT MONITOR CYCLE]
+  |
+  +--> invalid active_trade.json
+  |        |
+  |        v
+  |   [LOG ERROR]
+  |        |
+  |        v
+  |   [WAITING FOR ACTIVE TRADE]
+  |
+  +--> telegram send fail
+           |
+           v
+      [LOG ERROR]
+           |
+           v
+      [CONTINUE SYSTEM]
+
+      [main.py]
+  -> checks market
+  -> sends entry alert
+  -> trader decides manually
+
+[trader]
+  -> enters trade manually
+  -> writes / updates active_trade.json
+
+[trade_monitor.py]
+  -> watches active trade
+  -> checks current price every N seconds
+  -> warns trader in Thai:
+     HOLD
+     WATCH CLOSELY
+     TAKE SMALL PROFIT
+     EXIT NOW
+
+[key philosophy]
+  -> system is not auto-trading
+  -> system is an alert assistant
+  -> TP is a reference, not mandatory every time
+  -> protecting profit before reversal is a core goal
+
+
+
+
